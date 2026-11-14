@@ -1,0 +1,246 @@
+import json
+import random
+import time
+import urllib.error
+import urllib.request
+
+BASE_URL = "http://127.0.0.1:8000"
+API_URL = f"{BASE_URL}/evaluate"
+
+
+class TopologyPseudonymizer:
+    """Topology-preserving OOD pseudonymizer that maps entities to fresh codes 
+    while keeping the adjacency matrix, temporal deltas, and domestic mobile IP ranges 100% intact.
+    """
+    def __init__(self, seed: int = 42):
+        self.rng = random.Random(seed)
+        self.account_map = {}
+        self.wallet_map = {}
+        self.device_map = {}
+        self.subnet_map = {}
+
+    def _get_mapped_id(self, original_id: str, mapping_dict: dict, prefix: str) -> str:
+        if original_id is None:
+            return None
+        if original_id not in mapping_dict:
+            suffix = "".join(self.rng.choices("ABCDEF0123456789", k=6))
+            mapping_dict[original_id] = f"{prefix}_{suffix}"
+        return mapping_dict[original_id]
+
+    def pseudonymize_stream(self, stream: list[dict]) -> list[dict]:
+        new_stream = []
+        for tx in stream:
+            tx_copy = tx.copy()
+            
+            orig_acc = tx_copy.get("account_id")
+            orig_payout = tx_copy.get("payout_wallet_id")
+            orig_source = tx_copy.get("source_wallet_id")
+            orig_dev = tx_copy.get("device_hash")
+            orig_ip = tx_copy.get("ip_subnet")
+
+            acc_prefix = "ACCT_OOD"
+            if orig_acc and "EXT" in orig_acc:
+                acc_prefix = "WAL_EXT_OOD"
+
+            payout_prefix = "WAL_OOD"
+            if orig_payout and "EXT" in orig_payout:
+                payout_prefix = "WAL_EXT_OOD"
+
+            tx_copy["account_id"] = self._get_mapped_id(orig_acc, self.account_map, acc_prefix)
+            tx_copy["payout_wallet_id"] = self._get_mapped_id(orig_payout, self.wallet_map, payout_prefix)
+            if orig_source:
+                tx_copy["source_wallet_id"] = self._get_mapped_id(orig_source, self.wallet_map, payout_prefix)
+            
+            tx_copy["device_hash"] = self._get_mapped_id(orig_dev, self.device_map, "HW_FP_OOD")
+            
+            # Map IPs while preserving clean domestic mobile carrier subnets
+            if orig_ip:
+                if orig_ip not in self.subnet_map:
+                    if "117." in orig_ip:
+                        rand_octet = self.rng.randint(192, 240)
+                        self.subnet_map[orig_ip] = f"117.{rand_octet}.{self.rng.randint(1, 254)}.0/24"
+                    else:
+                        rand_octet = self.rng.randint(10, 200)
+                        self.subnet_map[orig_ip] = f"45.115.{rand_octet}.0/24"
+                tx_copy["ip_subnet"] = self.subnet_map[orig_ip]
+
+            new_stream.append(tx_copy)
+        return new_stream
+
+
+def build_base_stream_2():
+    rng = random.Random(42)
+    base_ts = 1699711200.0
+    stream = []
+
+    # 45 Isolated Retail Withdrawals
+    for i in range(45):
+        stream.append({
+            "tx_id": f"TXN_U2_{1000 + i}",
+            "account_id": f"ACCT_BK_{5000 + i}",
+            "payout_wallet_id": f"ACCT_EXT_{5000 + i}",
+            "requested_amount": round(rng.uniform(25000.0, 95000.0), 2),
+            "avg_historical_loan": round(rng.uniform(2500.0, 6500.0), 2),
+            "request_timestamp": base_ts + rng.uniform(0, 600),
+            "ip_subnet": f"117.{rng.randint(192, 240)}.{rng.randint(1, 254)}.0/24",
+            "device_hash": f"HW_FP_{8000 + i}",
+            "client_timezone": "Asia/Kolkata",
+            "is_ground_truth_fraud": False,
+        })
+
+    # 15 Multi-Hop IMPS Mule Cascades (60 transactions across 2 hops)
+    for c in range(15):
+        t_start = base_ts + (c * 14.0)
+        src = f"ACCT_BK_{7000 + c}"
+        mid_a = f"ACCT_BK_{7100 + c}"
+        mid_b = f"ACCT_BK_{7200 + c}"
+        end_c = f"ACCT_EXT_{7300 + c}"
+        amt_a = round(rng.uniform(88000.0, 96500.0), 2)
+        amt_b = round(rng.uniform(86000.0, 94500.0), 2)
+
+        stream.extend([
+            {
+                "tx_id": f"TXN_U2_{2000 + c*4}",
+                "account_id": src,
+                "payout_wallet_id": mid_a,
+                "requested_amount": amt_a,
+                "avg_historical_loan": 1100.0,
+                "request_timestamp": t_start,
+                "ip_subnet": "45.115.62.0/24",
+                "device_hash": f"HW_FP_F{100 + (c % 5)}",
+                "client_timezone": "Asia/Kolkata",
+                "is_ground_truth_fraud": True,
+            },
+            {
+                "tx_id": f"TXN_U2_{2001 + c*4}",
+                "account_id": src,
+                "payout_wallet_id": mid_b,
+                "requested_amount": amt_b,
+                "avg_historical_loan": 1100.0,
+                "request_timestamp": t_start + 4.2,
+                "ip_subnet": "45.115.62.0/24",
+                "device_hash": f"HW_FP_F{100 + (c % 5)}",
+                "client_timezone": "Asia/Kolkata",
+                "is_ground_truth_fraud": True,
+            },
+            {
+                "tx_id": f"TXN_U2_{2002 + c*4}",
+                "account_id": mid_a,
+                "source_wallet_id": src,
+                "payout_wallet_id": end_c,
+                "requested_amount": round(amt_a - 500.0, 2),
+                "avg_historical_loan": 850.0,
+                "request_timestamp": t_start + 28.0,
+                "ip_subnet": "45.115.62.0/24",
+                "device_hash": f"HW_FP_F{101 + (c % 5)}",
+                "client_timezone": "Asia/Kolkata",
+                "is_ground_truth_fraud": True,
+            },
+            {
+                "tx_id": f"TXN_U2_{2003 + c*4}",
+                "account_id": mid_b,
+                "source_wallet_id": src,
+                "payout_wallet_id": end_c,
+                "requested_amount": round(amt_b - 500.0, 2),
+                "avg_historical_loan": 900.0,
+                "request_timestamp": t_start + 33.5,
+                "ip_subnet": "45.115.62.0/24",
+                "device_hash": f"HW_FP_F{101 + (c % 5)}",
+                "client_timezone": "Asia/Kolkata",
+                "is_ground_truth_fraud": True,
+            },
+        ])
+
+    stream.sort(key=lambda x: x["request_timestamp"])
+    return stream
+
+
+def post_json(url: str, payload: dict) -> dict:
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code} from {url} -> {err_detail}") from e
+
+
+def run():
+    base_stream = build_base_stream_2()
+    pseudonymizer = TopologyPseudonymizer(seed=123)
+    dataset = pseudonymizer.pseudonymize_stream(base_stream)
+
+    print(f"=== OOD PSEUDONYMIZED RUN 2 (IMPS CASCADES) | TOTAL EVENTS: {len(dataset)} ===")
+    t_start = time.perf_counter()
+    
+    tp = 0
+    fp = 0
+    tn = 0
+    fn = 0
+    
+    latencies = []
+    flagged_events = []
+    last_saved = 0.0
+    quarantined_nodes = 0
+    last_bar = 0.0
+
+    for row in dataset:
+        tx_id = row.pop("tx_id")
+        is_fraud_gt = row.pop("is_ground_truth_fraud")
+        
+        t0 = time.perf_counter()
+        data = post_json(API_URL, row)
+        latencies.append((time.perf_counter() - t0) * 1000.0)
+
+        risk = float(data.get("risk_score", 0.0))
+        verdict = str(data.get("verdict", "")).upper()
+        action = str(data.get("action", "")).upper()
+        status = str(data.get("settlement_status", "UNKNOWN")).upper()
+        last_bar = data.get("dynamic_velocity_bar", last_bar)
+        last_saved = data.get("cumulative_capital_saved_inr", last_saved)
+        quarantined_nodes = data.get("quarantined_node_count", quarantined_nodes)
+
+        is_blocked = (verdict == "BLOCK" or "BLOCK" in action or "QUARANTINE" in action or risk >= 0.85)
+
+        if is_blocked and is_fraud_gt:
+            tp += 1
+            flagged_events.append((tx_id, row["account_id"], round(risk, 4), "TP", action))
+        elif is_blocked and not is_fraud_gt:
+            fp += 1
+            flagged_events.append((tx_id, row["account_id"], round(risk, 4), "FP", action))
+        elif not is_blocked and is_fraud_gt:
+            fn += 1
+            flagged_events.append((tx_id, row["account_id"], round(risk, 4), "FN", action))
+        else:
+            tn += 1
+
+    total_ms = (time.perf_counter() - t_start) * 1000.0
+    mean_latency = sum(latencies) / max(len(latencies), 1)
+    recall = (tp / max(tp + fn, 1)) * 100.0
+    precision = (tp / max(tp + fp, 1)) * 100.0
+
+    print("\n" + "="*55)
+    print("      OOD PSEUDONYMIZED AUDIT SCOREBOARD — RUN 2")
+    print("="*55)
+    print(f"Total Wall Time      : {total_ms:.2f} ms")
+    print(f"Mean Latency         : {mean_latency:.2f} ms / tx")
+    print(f"True Positives (TP)  : {tp} / 60")
+    print(f"False Positives (FP) : {fp} / 45")
+    print(f"True Negatives (TN)  : {tn} / 45")
+    print(f"False Negatives (FN) : {fn} / 60")
+    print(f"Fraud Recall         : {recall:.2f}%")
+    print(f"Precision            : {precision:.2f}%")
+    print(f"Final Dynamic Bar    : {last_bar}x")
+    print(f"Quarantined Nodes    : {quarantined_nodes}")
+    print(f"Capital Protected    : ₹{last_saved:,.2f}")
+    print("="*55)
+
+
+if __name__ == "__main__":
+    run()
